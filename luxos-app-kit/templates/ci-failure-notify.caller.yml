@@ -1,0 +1,31 @@
+# Copy to each app as: .github/workflows/ci-failure-notify.yml
+# Fires AFTER the app's "CI" workflow finishes; acts only when it failed. Zero coupling
+# to ci.yml — no edits to the existing pipeline. DMs the dev who pushed with what failed
+# and the safe fix (see pergolux-org-standards/.github/actions/ci-failure-notify).
+name: CI Failure Notify
+on:
+  workflow_run:
+    workflows: ["CI"]          # must match the `name:` of the app's ci.yml
+    types: [completed]
+jobs:
+  notify:
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read            # read the failed run's jobs + logs
+      contents: read
+    steps:
+      # SHA-pinned (mutable tags like @main/@v1 trip the Semgrep mutable-action-tag rule).
+      - uses: PERGOLUX-International/pergolux-org-standards/.github/actions/ci-failure-notify@ab398995cf3de4bfbb8c93a6d3cb4ecb5bbafd21 # v1
+        with:
+          run_id:       ${{ github.event.workflow_run.id }}
+          head_sha:     ${{ github.event.workflow_run.head_sha }}
+          head_branch:  ${{ github.event.workflow_run.head_branch }}
+          head_email:   ${{ github.event.workflow_run.head_commit.author.email }}
+          github_actor: ${{ github.event.workflow_run.actor.login }}
+          run_url:      ${{ github.event.workflow_run.html_url }}
+          repo:         ${{ github.repository }}
+          gh_token:          ${{ github.token }}
+          slack_bot_token:   ${{ secrets.SLACK_BOT_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}   # optional; omit to use the static map only
+          ci_owner:          ${{ vars.CI_OWNER_SLACK }}          # optional; DM'd (to route) only if the pusher can't be resolved
