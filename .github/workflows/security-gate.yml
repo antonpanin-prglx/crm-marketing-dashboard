@@ -1,0 +1,48 @@
+# LuxOS Security Gate — copy to .github/workflows/ in each app repo.
+# Make this a REQUIRED status check on the production branch (branch protection)
+# so failing/unverified code can never merge or deploy.
+name: LuxOS Security Gate
+
+# Runs on pull_request only. The gate is a MERGE gate, and every change reaches the
+# production branch via PR (direct pushes are blocked by branch protection), so the PR
+# run is the authoritative one. The PR run scans the DIFF against the base; a per-branch
+# `push` trigger re-scanned whole files on every commit, double-counting and producing
+# non-deterministic false positives on security-sensitive code (e.g. HMAC verifiers).
+on:
+  pull_request:
+
+jobs:
+  security-gate:
+    name: LuxOS Security Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 2 # need the previous commit for the diff
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: 20
+
+      # Dependency vulnerabilities → npm-audit.json (read by the scan script).
+      - name: Dependency audit
+        run: npm audit --json > npm-audit.json || true
+
+      # Static analysis (optional but recommended). Findings also surface in the AI review.
+      - name: Semgrep
+        continue-on-error: true
+        run: |
+          pip install semgrep >/dev/null 2>&1 || true
+          semgrep --config=auto --error --json --output=semgrep.json . || true
+
+      # Scan + gate: posts a signed verdict to LuxOS and blocks on failure.
+      - name: LuxOS scan + gate
+        run: node luxos-scan.mjs
+        env:
+          LUXOS_URL: ${{ secrets.LUXOS_URL }}
+          SECURITY_GATE_SECRET: ${{ secrets.SECURITY_GATE_SECRET }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+          AUTHOR_EMAIL: ${{ github.event.head_commit.author.email || github.actor }}

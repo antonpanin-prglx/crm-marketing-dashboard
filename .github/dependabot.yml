@@ -1,0 +1,37 @@
+version: 2
+updates:
+  # npm dependencies — open PRs to fix known-vulnerable / outdated packages.
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    # Wait 7 days after a release before opening a bump PR — a newly published
+    # version can be malicious or unstable; the cooldown lets bad releases get
+    # yanked before we pull them in.
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 10
+    groups:
+      # Group routine bumps into one PR to cut noise; security fixes still
+      # come through promptly.
+      all-dependencies:
+        patterns: ["*"]
+    ignore:
+      # Majors are migrations, not routine bumps — they need a person, so they are
+      # never proposed. Patch and minor updates still flow every month.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+    labels: ["dependencies"]
+
+  # Keep the GitHub Actions used by the security workflow up to date too.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "semiannually"
+    cooldown:
+      default-days: 7
+    groups:
+      # One PR for all action bumps — separate PRs edit adjacent lines and conflict.
+      all-actions:
+        patterns: ["*"]
+    labels: ["ci"]

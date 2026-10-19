@@ -1,0 +1,218 @@
+name: CI
+
+# Standard PERGOLUX CI: security suite + AI review gate + gated Vercel deploy.
+# Nothing reaches production unless the full suite is green.
+# Set the repo variable VERCEL_PROJECT_ID (Settings → Secrets and variables →
+# Actions → Variables) and the org/repo secret VERCEL_TOKEN to enable deploy.
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  semgrep:
+    name: Semgrep — static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with: { python-version: "3.12" }
+      - run: pip install --quiet semgrep
+      - name: Scan
+        run: |
+          semgrep scan --error --metrics=off \
+            --config p/security-audit \
+            --config p/secrets \
+            --config p/owasp-top-ten \
+            --config p/command-injection \
+            --config p/javascript \
+            --config p/typescript \
+            --config p/react
+
+  trivy:
+    name: Trivy — vulns, secrets & misconfig
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+
+  npm-audit:
+    name: npm audit — dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with: { node-version: 20 }
+      # Every PERGOLUX app stores its data in its OWN Supabase project (CLAUDE.md
+      # "Data storage"). Upstash / Vercel KV / Vercel Blob are not allowed.
+      - name: Storage is Supabase only
+        run: |
+          [ -f package.json ] || exit 0
+          node -e '
+            const p = require("./package.json");
+            const bad = Object.keys({ ...p.dependencies, ...p.devDependencies }).filter((k) => /^@upstash\/|^@vercel\/(kv|blob)$/.test(k));
+            if (bad.length) { console.error("::error::Not allowed: " + bad.join(", ") + " — store data in this app’s own Supabase project (see CLAUDE.md, Data storage)."); process.exit(1); }
+          '
+      - name: Audit dependencies (skips cleanly when there's nothing to audit)
+        run: |
+          if [ ! -f package.json ]; then
+            echo "No package.json in this repo — dependency audit not applicable (template scaffold has no Node deps). Skipping."
+            exit 0
+          fi
+          npm ci --ignore-scripts
+          npm audit --omit=dev --audit-level=high
+
+  verify:
+    name: Tests, typecheck & build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        # 24 because that is what these apps actually run on: 19 of the 21 Vercel
+        # projects are on 24.x. Verifying on an older major is how you find out in
+        # production that a language feature the code uses does not exist yet.
+        with: { node-version: 24 }
+      # Every other job here asks whether a scanner objects. None of them asks
+      # whether the code still works, so a PR that does not compile went green and
+      # a suite of passing tests ran nowhere. --if-present means an app without one
+      # of these scripts skips that step rather than failing on it.
+      - name: Verify (skips cleanly when there is nothing to build)
+        run: |
+          if [ ! -f package.json ]; then
+            # The scaffold has no app, but it does ship the app kit — and the kit's
+            # identity logic is the thing every app copies, so it gets tested here even
+            # though there is nothing to build. claims.ts has no imports precisely so
+            # this runs with nothing installed.
+            if ls test/*.test.ts >/dev/null 2>&1; then
+              echo "No package.json, but this repo ships tests — running them."
+              node --test --experimental-strip-types "test/*.test.ts"
+              exit $?
+            fi
+            echo "No package.json in this repo — nothing to verify (template scaffold has no app). Skipping."
+            exit 0
+          fi
+          npm ci --ignore-scripts
+          npm run typecheck --if-present
+          npm test --if-present
+          npm run build --if-present
+
+  trufflehog:
+    name: TruffleHog — verified secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Scan filesystem for verified secrets
+        run: |
+          docker run --rm -v "$PWD:/repo" trufflesecurity/trufflehog:latest \
+            filesystem /repo --only-verified --fail --no-update
+
+  osv-scanner:
+    name: OSV-Scanner (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: OSV scan
+        run: |
+          docker run --rm -v "$PWD:/src" ghcr.io/google/osv-scanner:latest \
+            scan source --lockfile=/src/package-lock.json || true
+
+  no-demo-data:
+    name: No demo/dummy data
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with: { node-version: 20 }
+      # Fails if mock/dummy/placeholder/seed data is found in shippable source.
+      # Real users see production data — fake numbers must never reach prod.
+      # Escape hatches (both logged): inline `luxos:allow-demo-data` comment, or
+      # DEMO_DATA_ALLOW="path/prefix,other/prefix" for whole dev-only paths.
+      - name: Scan for demo/dummy data
+        run: node .github/scripts/check-no-demo-data.mjs
+
+  ai-review:
+    name: AI review (Claude)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with: { node-version: 20 }
+      - name: Claude security review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: node .github/scripts/ai-review.mjs
+
+  # Hard gate: the LuxOS security-gate files MUST exist. If luxos-scan.mjs (or the
+  # security-gate workflow) is deleted, this fails — and because `deploy` needs it,
+  # production deployment is blocked. Make this a REQUIRED status check in branch
+  # protection so the gate can't be stripped to sneak a deploy through.
+  gate-present:
+    name: LuxOS gate present
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Require the LuxOS security gate
+        run: |
+          ok=1
+          [ -f luxos-scan.mjs ] || { echo "::error::luxos-scan.mjs is missing — the LuxOS security gate is required."; ok=0; }
+          [ -f .github/workflows/security-gate.yml ] || { echo "::error::.github/workflows/security-gate.yml is missing."; ok=0; }
+          [ "$ok" = "1" ] || { echo "Deployment blocked: restore the LuxOS security gate files."; exit 1; }
+
+  deploy:
+    name: Deploy to Vercel (production)
+    needs: [semgrep, trivy, npm-audit, trufflehog, no-demo-data, ai-review, gate-present, verify]
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with: { node-version: 20 }
+      - name: Deploy (skips cleanly until VERCEL_TOKEN + VERCEL_PROJECT_ID are set)
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          # No IDs in source. Set both as repo/org Variables (Settings → Secrets and
+          # variables → Actions → Variables): VERCEL_ORG_ID (your Vercel team) +
+          # VERCEL_PROJECT_ID (this app's project).
+          VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+        run: |
+          # A freshly scaffolded repo has no app until create-app.sh runs — nothing to
+          # deploy yet, so skip instead of failing (and paging the dev) on every commit.
+          if [ ! -f package.json ]; then
+            echo "No package.json yet — nothing to deploy. Run ./create-app.sh to scaffold the app."
+            exit 0
+          fi
+          if [ -z "$VERCEL_TOKEN" ] || [ -z "$VERCEL_PROJECT_ID" ]; then
+            echo "VERCEL_TOKEN or VERCEL_PROJECT_ID not set — checks passed, auto-deploy is off."
+            echo "Set org secret VERCEL_TOKEN and repo variable VERCEL_PROJECT_ID to enable it."
+            exit 0
+          fi
+          npm i -g vercel@latest
+          vercel pull --yes --environment=production --token "$VERCEL_TOKEN"
+          vercel build --prod --token "$VERCEL_TOKEN"
+          vercel deploy --prebuilt --prod --token "$VERCEL_TOKEN"

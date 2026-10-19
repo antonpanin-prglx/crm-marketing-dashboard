@@ -1,0 +1,77 @@
+# Dependabot, hands-off, once a month.
+#
+# Dependabot opens its PRs on the 1st of the month (.github/dependabot.yml: monthly).
+# This job runs every Saturday but only acts on the FIRST Saturday of the month, early
+# morning, when nobody is using the platform:
+#   - checks green   → squash-merged
+#   - a check failed → left open with the reason. Closing it would drop the bump (security
+#                      patches included) until next month; open, Dependabot keeps it updated.
+#   - still running  → left for next month
+# Then it re-runs CI on the default branch, which is what deploys production — a merge
+# made with GITHUB_TOKEN does not trigger the push-to-main deploy by itself.
+#
+# GitHub Actions bumps (twice a year) edit workflow files, which GITHUB_TOKEN may not merge —
+# those are left open for a person. npm bumps, the monthly bulk, merge fine.
+#
+# Vercel's PR check always fails on bot commits (the author is not on the Vercel team)
+# and is not what deploys production, so it is ignored here.
+#
+# SECURITY: never checks out or runs PR code — it only reads check results and calls the API.
+name: Dependabot monthly merge
+
+on:
+  schedule:
+    - cron: "0 3 * * 6" # Saturdays 03:00 UTC; exits unless it is day 1–7 of the month
+  workflow_dispatch: # a manual run acts regardless of the date
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write # to re-run CI on the default branch
+  checks: read # to see a PR's check results
+  statuses: read
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge green, leave the rest open
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [ "$EVENT" = schedule ] && [ "$(date -u +%-d)" -gt 7 ]; then
+            echo "Not the first Saturday of the month; nothing to do."; exit 0
+          fi
+          log() { echo "$1" | tee -a "$GITHUB_STEP_SUMMARY"; }
+          merged=0
+          # Filter on the author field, not `--author`: that goes through the search index,
+          # which lags and silently returns nothing. The bot's login reads "app/dependabot"
+          # to a user token and "dependabot" to GITHUB_TOKEN, so accept both.
+          prs=$(gh pr list --state open --limit 100 --json number,author --jq '.[] | select(.author.login | test("^(app/)?dependabot(\\[bot\\])?$")) | .number')
+          echo "Open Dependabot PRs: ${prs:-none}"
+          for n in $prs; do
+            # gh exits non-zero while checks fail or run; the JSON on stdout is still valid.
+            checks=$(gh pr checks "$n" --json name,bucket 2>/dev/null) || true
+            checks=$(jq -c '[.[] | select(.name | startswith("Vercel") | not)]' <<<"${checks:-[]}")
+            fail=$(jq -r '[.[] | select(.bucket == "fail" or .bucket == "cancel") | .name] | unique | join(", ")' <<<"$checks")
+            pending=$(jq '[.[] | select(.bucket == "pending")] | length' <<<"$checks")
+            if [ -n "$fail" ]; then
+              gh pr comment "$n" -b "Left open by the monthly Dependabot run — failing check(s): $fail. Fix the cause (often a red check already on the default branch) and merge by hand."
+              log "- left #$n — failing: $fail"
+            elif [ "$(jq length <<<"$checks")" -eq 0 ]; then
+              log "- left #$n — no check results visible"
+            elif [ "$pending" -gt 0 ]; then
+              log "- left #$n — checks still running"
+            elif gh pr merge "$n" --squash --delete-branch; then
+              merged=1; log "- merged #$n"
+            else
+              log "- left #$n — could not merge (see the error above; GitHub Actions bumps need a person)"
+            fi
+          done
+          if [ "$merged" = 1 ] && gh workflow view ci.yml >/dev/null 2>&1; then
+            gh workflow run ci.yml --ref "$BRANCH"
+            log "- re-ran CI on $BRANCH (deploys)"
+          fi
